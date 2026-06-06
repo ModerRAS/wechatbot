@@ -1,6 +1,6 @@
 # @wechatbot/pi-agent
 
-Pi extension — type `/wechat` in pi, scan QR code in terminal, chat with Pi from WeChat.
+Pi extension — type `/wechat` in pi, scan QR code in terminal, then drive Pi from WeChat with sticky `steer` / `follow-up` control modes.
 
 ## Install
 
@@ -41,11 +41,44 @@ cp -r . ~/.pi/agent/extensions/wechat/
 
 ```
 /wechat              Scan QR code → connect WeChat to this pi session
-/weixin              Alias for /wechat
-/wechat --force      Force re-login (new QR code)
-/wechat-disconnect   Disconnect
-/wechat-send <text>  Send text to WeChat user manually
 ```
+
+### WeChat-side commands
+
+Once connected, send these commands from WeChat itself:
+
+```
+/steer               Switch sticky mode to steer (default)
+/followup            Switch sticky mode to follow-up
+/history             Show unified history across both modes
+/open <id>           Open one history entry and wait for replacement text
+/status              Show current mode, ui state, history counts, queue counts
+/cancel              Exit history/edit helper state
+/help                Show command help
+```
+
+### Mode behavior
+
+- Default mode is `steer`.
+- In `steer` mode, every normal text message is sent to Pi as a steer message when Pi is busy; if Pi is idle, it is sent immediately as a normal turn.
+- In `follow-up` mode, every normal text message is sent as a follow-up when Pi is busy; if Pi is idle, it is also sent immediately as a normal turn.
+- Modes are sticky: they stay active until you switch to the other mode.
+
+### Unified history
+
+- `/history` shows a single reverse-chronological list for both modes.
+- Entries are labeled like `12 [F#5] ...` or `11 [S#6] ...`.
+- `12` is the global history id used by `/open 12`.
+- `F#5` means the 5th follow-up entry; `S#6` means the 6th steer entry.
+
+### Editing a history item
+
+1. Send `/history`
+2. Send `/open <id>`
+3. The bridge replies with the full original text
+4. Your next plain text message becomes the replacement and is re-sent using the original entry's mode
+
+This does **not** rewrite Pi's internal queued messages. It creates a new steer/follow-up entry, matching Pi's public extension API behavior.
 
 ### What happens
 
@@ -65,9 +98,10 @@ cp -r . ~/.pi/agent/extensions/wechat/
 
   [wechat] ✓ Connected: e06c1ceea05e@im.bot
 
-# Now send "帮我看看这个bug" from WeChat...
-# Pi processes it, sends reply back to WeChat.
-# "对方正在输入中..." shown while Pi thinks.
+# Now send "/followup" from WeChat...
+# Then send "帮我继续展开部署步骤"
+# Pi queues it as a follow-up and sends the reply back to WeChat.
+# "对方正在输入中..." is shown while Pi is working on your active request.
 ```
 
 ## How It Works
@@ -81,18 +115,24 @@ iLink API (Tencent) ←── @wechatbot/wechatbot SDK
     ▼
 Pi Extension
     │
-    ├── WeChat msg → pi.sendUserMessage(text)  → pi processes as prompt
+    ├── WeChat msg → state machine decides:
+    │       - command reply
+    │       - steer dispatch
+    │       - follow-up dispatch
     │
-    └── pi.on('agent_end') → bot.reply(text)   → sent back to WeChat
+    ├── dispatch → pi.sendUserMessage(..., { deliverAs })
+    │
+    └── Pi turn finishes → reply routed back to the matching WeChat message
 ```
 
 1. `/wechat` creates a `WeChatBot` instance (SDK)
 2. SDK calls iLink API → gets QR URL
 3. `qrcode-terminal` renders QR code in pi TUI via `ctx.ui.setWidget()`
 4. User scans QR in WeChat → login confirmed → credentials saved
-5. SDK starts long-poll → incoming WeChat messages trigger `pi.sendUserMessage()`
-6. When pi finishes (`agent_end` event), response is sent back via `bot.reply()`
-7. `bot.sendTyping()` shows "对方正在输入中..." while pi thinks
+5. SDK starts long-poll → incoming WeChat messages go through the bridge state machine
+6. The bridge records request/history metadata and dispatches to Pi with `sendUserMessage()`
+7. When a Pi turn completes, the matching response is sent back via `bot.reply()`
+8. `bot.sendTyping()` shows "对方正在输入中..." while Pi thinks
 
 ## QR Code Display
 
@@ -108,6 +148,7 @@ This extension is the developer. It receives the URL via `onQrUrl` callback and 
 | `@wechatbot/wechatbot` | WeChat iLink Bot SDK — login, poll, send, typing, context_token |
 | `qrcode-terminal` | Render scannable QR code in terminal |
 | `@mariozechner/pi-coding-agent` | Pi extension API (peer dependency) |
+| `vitest` | Local tests for bridge state machine and request ledger |
 
 ## Pi Package
 

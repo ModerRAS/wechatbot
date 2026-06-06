@@ -1,16 +1,18 @@
 /**
  * Pi Extension: WeChat Bridge
  *
- * Type /wechat or /weixin in pi → QR code appears → scan with WeChat →
- * WeChat messages become pi prompts → pi responses sent back to WeChat.
+ * Type /wechat in pi -> QR code appears -> scan with WeChat ->
+ * WeChat messages become pi prompts -> pi responses sent back to WeChat.
  *
  * Supports:
- *   - Text messages (bidirectional)
- *   - Image messages (receive → send to pi as vision, reply back)
- *   - File messages (text files → include content, others → describe)
- *   - Video messages (download → save to temp → tell pi the path)
- *   - Voice messages (transcribed text or SILK→WAV download)
- *   - Markdown stripping (pi responses → plain text for WeChat)
+ *   - Two sticky control modes: steer and follow-up
+ *   - Unified command history across both modes
+ *   - History re-open + resend for text prompts
+ *   - Image messages (receive -> send to pi as vision)
+ *   - File messages (text files -> include content, others -> describe)
+ *   - Video messages (download -> save to temp -> tell pi the path)
+ *   - Voice messages (transcribed text or SILK->WAV download)
+ *   - Markdown stripping (pi responses -> plain text for WeChat)
  *   - Media auto-routing (image/video/file by MIME type)
  *
  * Uses @wechatbot/wechatbot SDK for iLink protocol.
@@ -25,106 +27,85 @@ import {
 } from '@wechatbot/wechatbot'
 import qrTerminal from 'qrcode-terminal'
 import { readFile, writeFile, mkdtemp } from 'node:fs/promises'
-import { basename, join, extname } from 'node:path'
+import { basename, extname, join } from 'node:path'
 import { tmpdir } from 'node:os'
+
+import {
+  WechatBridgeController,
+  type PiContent,
+  type PreparedWechatMessage,
+} from './bridge-controller.js'
+import type { HistorySourceType, RouteMode } from './bridge-state.js'
 
 export default function wechatBridge(pi: ExtensionAPI) {
   let bot: WeChatBot | null = null
   let connected = false
-  let activeUserId: string | null = null
-  let pendingReply: IncomingMessage | null = null
-  let assistantText = ''
-  let isStreaming = false
-
-  // ── Inject system prompt so agent knows about WeChat bridge ────────
+  const controller = new WechatBridgeController<IncomingMessage>()
 
   pi.on('before_agent_start', async (event) => {
-    if (!connected || !bot || !pendingReply) return
+    if (!connected || !bot) return
+
+    const activeRequest = controller.getActiveRequest() ?? controller.activateNextRequest()
+    if (!activeRequest) return
 
     return {
-      systemPrompt: event.systemPrompt + `\n
-## WeChat Bridge (Active)
-
-You are currently bridged to WeChat via the wechatbot extension.
-A real WeChat user is chatting with you — your response will be sent back to them.
-
-Key behaviors:
-- **No markdown**: WeChat doesn't render markdown. Write plain text. Use line breaks for structure.
-- **Send files**: To send a file (image, video, document) back to WeChat, mention its absolute path in your response (e.g. /tmp/photo.png). The bridge auto-detects paths ending in media extensions and sends them as attachments.
-- **Concise replies**: WeChat is a mobile chat app. Keep responses short and conversational.
-- **Media received**: Images arrive as vision input. Videos/voice/files are described with metadata.
-`,
+      systemPrompt: buildWechatSystemPrompt(event.systemPrompt, activeRequest.mode),
     }
   })
 
-  // ── Capture pi response → send back to WeChat ────────────────────
-
-  pi.on('agent_end', async (event, ctx) => {
-    if (!bot || !connected || !pendingReply) return
-
-    const reply = pendingReply
-    pendingReply = null
-    isStreaming = false
-
-    const messages = event.messages ?? []
-    let finalText = ''
-    for (const msg of messages) {
-      if (msg.role === 'assistant') {
-        for (const block of msg.content) {
-          if (block.type === 'text') finalText += block.text
-        }
-      }
-    }
-    if (!finalText.trim()) finalText = assistantText || '[No response]'
-
-    // Strip markdown for WeChat (WeChat doesn't render markdown)
-    const cleanText = stripMarkdown(finalText)
-
-    try {
-      await bot.stopTyping(reply.userId)
-
-      // Check if pi generated any media files we should send
-      const mediaFiles = extractMediaPaths(finalText)
-      if (mediaFiles.length > 0) {
-        // Send text first (without file paths), then media
-        const textWithoutPaths = removeMediaPaths(cleanText, mediaFiles)
-        if (textWithoutPaths.trim()) {
-          await bot.reply(reply, textWithoutPaths)
-        }
-        for (const filePath of mediaFiles) {
-          try {
-            const data = await readFile(filePath)
-            const fileName = basename(filePath)
-            await bot.reply(reply, { file: data, fileName })
-          } catch {
-            await bot.reply(reply, `[Failed to send file: ${basename(filePath)}]`)
-          }
-        }
-      } else {
-        await bot.reply(reply, cleanText)
-      }
-
-      ctx.ui.setStatus('wechat', `✓ Replied to WeChat`)
-    } catch (e) {
-      ctx.ui.setStatus('wechat', `✗ Reply failed: ${e instanceof Error ? e.message : e}`)
-    }
-    assistantText = ''
+  pi.on('turn_start', async () => {
+    if (!connected || !bot) return
+    controller.activateNextRequest()
   })
 
   pi.on('message_update', async (event) => {
-    if (!isStreaming) return
-    if (event.message.role === 'assistant') {
-      let text = ''
-      for (const block of event.message.content) {
-        if (block.type === 'text') text += block.text
-      }
-      assistantText = text
+    if (event.message.role !== 'assistant') return
+
+    const text = extractAssistantText(event.message)
+    if (!text) return
+    controller.setActiveAssistantText(text)
+  })
+
+  pi.on('turn_end', async (event, ctx) => {
+    if (!bot || !connected) return
+    if (event.toolResults.length > 0) return
+
+    const request = controller.markActiveRequestReplying()
+    if (!request?.sourceMessage) return
+
+    const finalText = extractAssistantText(event.message) || request.assistantBuffer || '[No response]'
+
+    try {
+      await bot.stopTyping(request.sourceUserId)
+      await replyWithMediaAwareContent(bot, request.sourceMessage, finalText)
+      ctx.ui.setStatus('wechat', `✓ Replied [${request.mode === 'steer' ? 'S' : 'F'}] ${request.previewText}`)
+    } catch (error) {
+      ctx.ui.setStatus('wechat', `✗ Reply failed: ${error instanceof Error ? error.message : error}`)
+    } finally {
+      controller.finishActiveRequest()
     }
   })
 
-  // ── /wechat and /weixin commands ──────────────────────────────────
+  pi.on('agent_end', async (event, ctx) => {
+    if (!bot || !connected) return
 
-  const startWechat = async (args: string | undefined, ctx: any) => {
+    const request = controller.getActiveRequest()
+    if (!request?.sourceMessage) return
+
+    const finalText = extractAssistantTextFromMessages(event.messages) || request.assistantBuffer || '[No response]'
+
+    try {
+      await bot.stopTyping(request.sourceUserId)
+      await replyWithMediaAwareContent(bot, request.sourceMessage, finalText)
+      ctx.ui.setStatus('wechat', `✓ Replied [${request.mode === 'steer' ? 'S' : 'F'}] ${request.previewText}`)
+    } catch (error) {
+      ctx.ui.setStatus('wechat', `✗ Reply failed: ${error instanceof Error ? error.message : error}`)
+    } finally {
+      controller.finishActiveRequest()
+    }
+  })
+
+  const startWechat = async (_args: string | undefined, ctx: any) => {
     if (connected && bot) {
       const action = await ctx.ui.select('WeChat is connected', [
         'Reconnect', 'Disconnect', 'Status', 'Cancel',
@@ -133,31 +114,34 @@ Key behaviors:
         ctx.ui.setStatus('wechat', '🔄 Reconnecting…')
         bot.stop()
         connected = false
-        activeUserId = null
-        pendingReply = null
+        controller.reset()
         bot = null
-        // Fall through to login flow below
       } else if (action === 'Disconnect') {
-        bot.stop(); connected = false
-        activeUserId = null
-        pendingReply = null
+        bot.stop()
+        connected = false
+        controller.reset()
         ctx.ui.setStatus('wechat', undefined)
         ctx.ui.notify('WeChat disconnected', 'info')
         bot = null
         return
       } else if (action === 'Status') {
         const creds = bot.getCredentials()
-        ctx.ui.notify(`Account: ${creds?.accountId}\nUser: ${creds?.userId}`, 'info')
+        ctx.ui.notify(
+          [
+            `Account: ${creds?.accountId}`,
+            `User: ${creds?.userId}`,
+            `Mode: ${controller.state.routeMode}`,
+            `History: ${controller.state.historyLog.length}`,
+          ].join('\n'),
+          'info',
+        )
         return
       } else {
         return
       }
     }
 
-    // Try stored credentials first; only force QR scan if none exist.
-    // This avoids requiring a new QR scan on every service restart (issue #40).
     bot = new WeChatBot({ storage: 'file', logLevel: 'warn' })
-
     ctx.ui.setStatus('wechat', '⏳ Connecting…')
 
     try {
@@ -184,29 +168,29 @@ Key behaviors:
         },
       })
 
-      ctx.ui.setStatus('wechat', `✓ WeChat: ${creds.accountId}`)
-      ctx.ui.notify(`WeChat connected!\nAccount: ${creds.accountId}`, 'info')
       connected = true
+      controller.reset()
+      ctx.ui.setStatus('wechat', `✓ WeChat: ${creds.accountId} | mode: steer`)
+      ctx.ui.notify(`WeChat connected!\nAccount: ${creds.accountId}`, 'info')
 
       bot.onMessage(async (msg: IncomingMessage) => {
-        activeUserId = msg.userId
-        pendingReply = msg
-        isStreaming = true
-        assistantText = ''
+        if (!bot) return
 
-        try { await bot!.sendTyping(msg.userId) } catch {}
+        const result = await handleWechatMessage(pi, ctx, controller, bot, msg)
 
-        // Build pi message content based on message type
-        const piContent = await buildPiContent(msg, bot!)
-
-        if (typeof piContent === 'string') {
-          ctx.ui.setStatus('wechat', `📱 ${piContent.slice(0, 60)}`)
-          pi.sendUserMessage(piContent)
-        } else {
-          const preview = piContent.find(b => b.type === 'text')
-          ctx.ui.setStatus('wechat', `📱 ${(preview as any)?.text?.slice(0, 60) ?? '[media]'}`)
-          pi.sendUserMessage(piContent)
+        if (result.type === 'reply') {
+          await bot.reply(msg, result.text)
+          ctx.ui.setStatus('wechat', `✓ WeChat: ${creds.accountId} | mode: ${controller.state.routeMode}`)
+          return
         }
+
+        try {
+          await bot.sendTyping(msg.userId)
+        } catch {
+          // Best effort only.
+        }
+
+        ctx.ui.setStatus('wechat', `📱 [${result.mode === 'steer' ? 'S' : 'F'}] ${result.request.previewText}`)
       })
 
       bot.on('error', (err) => {
@@ -215,18 +199,20 @@ Key behaviors:
       bot.on('session:expired', () => {
         ctx.ui.setStatus('wechat', '⚠ Session expired — re-login…')
       })
-      bot.on('session:restored', (c) => {
-        ctx.ui.setStatus('wechat', `✓ Reconnected: ${c.accountId}`)
+      bot.on('session:restored', (restored) => {
+        ctx.ui.setStatus('wechat', `✓ Reconnected: ${restored.accountId} | mode: ${controller.state.routeMode}`)
       })
 
-      bot.start().catch((e) => {
-        ctx.ui.setStatus('wechat', `✗ Poll error: ${e instanceof Error ? e.message : e}`)
+      bot.start().catch((error) => {
         connected = false
+        controller.reset()
+        ctx.ui.setStatus('wechat', `✗ Poll error: ${error instanceof Error ? error.message : error}`)
       })
-
-    } catch (e) {
+    } catch (error) {
       ctx.ui.setStatus('wechat', undefined)
-      ctx.ui.notify(`Login failed: ${e instanceof Error ? e.message : e}`, 'error')
+      ctx.ui.notify(`Login failed: ${error instanceof Error ? error.message : error}`, 'error')
+      connected = false
+      controller.reset()
       bot = null
     }
   }
@@ -237,64 +223,189 @@ Key behaviors:
   })
 
   pi.on('session_shutdown', async () => {
-    if (bot) { bot.stop(); bot = null }
+    if (bot) {
+      bot.stop()
+      bot = null
+    }
     connected = false
+    controller.reset()
   })
 
   pi.on('session_start', async (_event, ctx) => {
     if (connected && bot) {
-      ctx.ui.setStatus('wechat', `✓ WeChat: ${bot.getCredentials()?.accountId ?? 'connected'}`)
+      ctx.ui.setStatus('wechat', `✓ WeChat: ${bot.getCredentials()?.accountId ?? 'connected'} | mode: ${controller.state.routeMode}`)
     }
   })
 }
 
-// ── Helper: Build pi message content from WeChat message ──────────────
+async function handleWechatMessage(
+  pi: ExtensionAPI,
+  ctx: any,
+  controller: WechatBridgeController<IncomingMessage>,
+  bot: WeChatBot,
+  msg: IncomingMessage,
+) {
+  const rawText = msg.type === 'text' ? msg.text ?? '' : undefined
+  const prepared = rawText?.trim().startsWith('/')
+    ? prepareCommandMessage(rawText)
+    : await prepareWechatMessage(msg, bot)
 
-type PiContent = string | Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }>
+  const result = controller.handleIncoming({
+    sourceMessage: msg,
+    userId: msg.userId,
+    rawText,
+    prepared,
+  })
 
-async function buildPiContent(msg: IncomingMessage, bot: WeChatBot): Promise<PiContent> {
+  if (result.type === 'dispatch') {
+    sendUserMessage(pi, ctx, result.mode, result.content)
+  }
+
+  return result
+}
+
+function sendUserMessage(pi: ExtensionAPI, ctx: any, mode: RouteMode, content: PiContent): void {
+  try {
+    if (ctx.isIdle()) {
+      pi.sendUserMessage(content)
+      return
+    }
+  } catch {
+    // Fall through to explicit delivery mode retry.
+  }
+
+  pi.sendUserMessage(content, { deliverAs: mode })
+}
+
+function buildWechatSystemPrompt(baseSystemPrompt: string, mode: RouteMode): string {
+  return baseSystemPrompt + `\n
+## WeChat Bridge (Active)
+
+You are currently bridged to WeChat via the wechatbot extension.
+A real WeChat user is chatting with you — your response will be sent back to them.
+
+Current delivery mode: ${mode === 'steer' ? 'steer' : 'follow-up'}.
+
+Key behaviors:
+- No markdown: WeChat doesn't render markdown. Write plain text. Use line breaks for structure.
+- Send files: To send a file (image, video, document) back to WeChat, mention its absolute path in your response (for example /tmp/photo.png). The bridge auto-detects paths ending in media extensions and sends them as attachments.
+- Concise replies: WeChat is a mobile chat app. Keep responses short and conversational.
+- Media received: Images arrive as vision input. Videos, voice, and files are described with metadata.
+`
+}
+
+function prepareCommandMessage(text: string): PreparedWechatMessage {
+  return {
+    content: text,
+    fullText: text,
+    preview: text,
+    editable: true,
+    sourceType: 'text',
+  }
+}
+
+async function prepareWechatMessage(msg: IncomingMessage, bot: WeChatBot): Promise<PreparedWechatMessage> {
   switch (msg.type) {
-    case 'text':
-      return msg.text || '[empty message]'
+    case 'text': {
+      const text = msg.text || '[empty message]'
+      return {
+        content: text,
+        fullText: text,
+        preview: text,
+        editable: true,
+        sourceType: 'text',
+      }
+    }
 
     case 'image': {
       const media = await bot.download(msg)
-      if (!media) return '[Image received but could not be downloaded]'
+      if (!media) {
+        const text = '[Image received but could not be downloaded]'
+        return {
+          content: text,
+          fullText: text,
+          preview: text,
+          editable: false,
+          sourceType: 'image',
+        }
+      }
 
-      const content: PiContent = []
-      content.push({ type: 'text', text: msg.text !== '[image]' ? msg.text : 'User sent an image from WeChat:' })
-      content.push({ type: 'image', data: media.data.toString('base64'), mimeType: 'image/jpeg' })
-      return content
+      const promptText = msg.text && msg.text !== '[image]' ? msg.text : 'User sent an image from WeChat:'
+      return {
+        content: [
+          { type: 'text', text: promptText },
+          { type: 'image', data: media.data.toString('base64'), mimeType: 'image/jpeg' },
+        ],
+        fullText: `${promptText}\n[image attached]`,
+        preview: promptText,
+        editable: false,
+        sourceType: 'image',
+      }
     }
 
     case 'voice': {
       const voice = msg.voices[0]
-      if (voice?.text) return `[Voice message, transcribed]: ${voice.text}`
+      if (voice?.text) {
+        const text = `[Voice message, transcribed]: ${voice.text}`
+        return {
+          content: text,
+          fullText: text,
+          preview: text,
+          editable: false,
+          sourceType: 'voice',
+        }
+      }
 
       const media = await bot.download(msg)
-      if (media) {
-        return `[Voice message received (${media.format}, ${media.data.length} bytes). No transcription available — please ask the user to type their message.]`
+      const text = media
+        ? `[Voice message received (${media.format}, ${media.data.length} bytes). No transcription available — please ask the user to type their message.]`
+        : '[Voice message received but could not be downloaded]'
+      return {
+        content: text,
+        fullText: text,
+        preview: text,
+        editable: false,
+        sourceType: 'voice',
       }
-      return '[Voice message received but could not be downloaded]'
     }
 
     case 'file': {
       const file = msg.files[0]
       const fileName = file?.fileName ?? 'unknown file'
       const fileSize = file?.size ? ` (${formatFileSize(file.size)})` : ''
+      const textExts = new Set([
+        '.txt', '.md', '.csv', '.json', '.xml', '.html', '.yaml', '.yml', '.toml', '.log',
+        '.py', '.js', '.ts', '.go', '.rs', '.java', '.c', '.cpp', '.h',
+      ])
 
-      const textExts = new Set(['.txt', '.md', '.csv', '.json', '.xml', '.html', '.yaml', '.yml', '.toml', '.log', '.py', '.js', '.ts', '.go', '.rs', '.java', '.c', '.cpp', '.h'])
       if (textExts.has(extname(fileName).toLowerCase())) {
         try {
           const media = await bot.download(msg)
           if (media) {
             const text = media.data.toString('utf-8')
-            const truncated = text.length > 10000 ? text.slice(0, 10000) + '\n... [truncated]' : text
-            return `[File: ${fileName}${fileSize}]\n\n\`\`\`\n${truncated}\n\`\`\``
+            const truncated = text.length > 10000 ? `${text.slice(0, 10000)}\n... [truncated]` : text
+            const prompt = `[File: ${fileName}${fileSize}]\n\n\`\`\`\n${truncated}\n\`\`\``
+            return {
+              content: prompt,
+              fullText: prompt,
+              preview: `[File] ${fileName}${fileSize}`,
+              editable: false,
+              sourceType: 'file',
+            }
           }
-        } catch { /* fall through */ }
+        } catch {
+          // Fall through to generic file description.
+        }
       }
-      return `[File received: ${fileName}${fileSize}. To process this file, ask the user to share its content as text.]`
+
+      const prompt = `[File received: ${fileName}${fileSize}. To process this file, ask the user to share its content as text.]`
+      return {
+        content: prompt,
+        fullText: prompt,
+        preview: `[File] ${fileName}${fileSize}`,
+        editable: false,
+        sourceType: 'file',
+      }
     }
 
     case 'video': {
@@ -303,21 +414,120 @@ async function buildPiContent(msg: IncomingMessage, bot: WeChatBot): Promise<PiC
       try {
         const media = await bot.download(msg)
         if (media) {
-          const tmpDir = await mkdtemp(join(tmpdir(), 'wechat-video-'))
-          const videoPath = join(tmpDir, 'video.mp4')
+          const tempDir = await mkdtemp(join(tmpdir(), 'wechat-video-'))
+          const videoPath = join(tempDir, 'video.mp4')
           await writeFile(videoPath, media.data)
-          return `[Video received${duration}, saved to: ${videoPath}. You can access this file for processing.]`
+          const prompt = `[Video received${duration}, saved to: ${videoPath}. You can access this file for processing.]`
+          return {
+            content: prompt,
+            fullText: prompt,
+            preview: `[Video]${duration || ' received'}`,
+            editable: false,
+            sourceType: 'video',
+          }
         }
-      } catch { /* fall through */ }
-      return `[Video received${duration} but could not be downloaded.]`
+      } catch {
+        // Fall through to generic video description.
+      }
+
+      const prompt = `[Video received${duration} but could not be downloaded.]`
+      return {
+        content: prompt,
+        fullText: prompt,
+        preview: `[Video]${duration || ' received'}`,
+        editable: false,
+        sourceType: 'video',
+      }
     }
 
-    default:
-      return `[${msg.type} message received — not supported yet]`
+    default: {
+      const sourceType = normalizeHistorySourceType(msg.type)
+      const prompt = `[${msg.type} message received — not supported yet]`
+      return {
+        content: prompt,
+        fullText: prompt,
+        preview: prompt,
+        editable: false,
+        sourceType,
+      }
+    }
   }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────
+async function replyWithMediaAwareContent(bot: WeChatBot, reply: IncomingMessage, finalText: string): Promise<void> {
+  const cleanText = stripMarkdown(finalText)
+  const mediaFiles = extractMediaPaths(finalText)
+
+  if (mediaFiles.length > 0) {
+    const textWithoutPaths = removeMediaPaths(cleanText, mediaFiles)
+    if (textWithoutPaths.trim()) {
+      await bot.reply(reply, textWithoutPaths)
+    }
+
+    for (const filePath of mediaFiles) {
+      try {
+        const data = await readFile(filePath)
+        await bot.reply(reply, { file: data, fileName: basename(filePath) })
+      } catch {
+        await bot.reply(reply, `[Failed to send file: ${basename(filePath)}]`)
+      }
+    }
+    return
+  }
+
+  await bot.reply(reply, cleanText)
+}
+
+function extractAssistantText(message: unknown): string {
+  if (!isAssistantMessage(message)) return ''
+
+  let text = ''
+  for (const block of message.content) {
+    if (block.type === 'text' && typeof block.text === 'string') {
+      text += block.text
+    }
+  }
+  return text
+}
+
+function extractAssistantTextFromMessages(messages: unknown[]): string {
+  let text = ''
+  for (const message of messages) {
+    text += extractAssistantText(message)
+  }
+  return text
+}
+
+function isAssistantMessage(
+  value: unknown,
+): value is { role: 'assistant'; content: Array<{ type: string; text?: string }> } {
+  if (!value || typeof value !== 'object') return false
+
+  const maybeMessage = value as { role?: unknown; content?: unknown }
+  if (maybeMessage.role !== 'assistant') return false
+  if (!Array.isArray(maybeMessage.content)) return false
+
+  return maybeMessage.content.every((block) => {
+    if (!block || typeof block !== 'object') return false
+    const candidate = block as { type?: unknown; text?: unknown }
+    if (typeof candidate.type !== 'string') return false
+    if ('text' in candidate && candidate.text !== undefined && typeof candidate.text !== 'string') return false
+    return true
+  })
+}
+
+function normalizeHistorySourceType(type: string): HistorySourceType {
+  switch (type) {
+    case 'text':
+    case 'image':
+    case 'voice':
+    case 'file':
+    case 'video':
+      return type
+    default:
+      return 'structured'
+  }
+}
 
 function extractMediaPaths(text: string): string[] {
   const paths: string[] = []
@@ -325,16 +535,16 @@ function extractMediaPaths(text: string): string[] {
   const pathRegex = /(?:^|\s)((?:\/[\w./-]+|\.\/[\w./-]+))/gm
   let match
   while ((match = pathRegex.exec(text)) !== null) {
-    const p = match[1].trim()
-    if (mediaExts.test(p)) paths.push(p)
+    const filePath = match[1].trim()
+    if (mediaExts.test(filePath)) paths.push(filePath)
   }
   return [...new Set(paths)]
 }
 
 function removeMediaPaths(text: string, paths: string[]): string {
   let result = text
-  for (const p of paths) {
-    result = result.replace(new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '')
+  for (const filePath of paths) {
+    result = result.replace(new RegExp(filePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '')
   }
   return result.replace(/\n{3,}/g, '\n\n').trim()
 }
