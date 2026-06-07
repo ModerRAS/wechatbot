@@ -70,6 +70,14 @@ export default function wechatBridge(pi: ExtensionAPI) {
     if (!bot || !connected) return
     if (event.toolResults.length > 0) return
 
+    if (!shouldReplyOnTurnEnd(event.message)) {
+      const pendingRequest = controller.getActiveRequest()
+      if (pendingRequest) {
+        ctx.ui.setStatus('wechat', `⏳ Waiting for final Pi result [${pendingRequest.mode === 'steer' ? 'S' : 'F'}] ${pendingRequest.previewText}`)
+      }
+      return
+    }
+
     const request = controller.markActiveRequestReplying()
     if (!request?.sourceMessage) return
 
@@ -478,34 +486,71 @@ async function replyWithMediaAwareContent(bot: WeChatBot, reply: IncomingMessage
   await bot.reply(reply, cleanText)
 }
 
+type AssistantStopReason = 'stop' | 'length' | 'toolUse' | 'error' | 'aborted'
+
+type AssistantMessageLike = {
+  role: 'assistant'
+  content: Array<{ type: string; text?: string }>
+  stopReason?: AssistantStopReason
+  errorMessage?: string
+}
+
+function shouldReplyOnTurnEnd(message: unknown): boolean {
+  const assistantMessage = getAssistantMessage(message)
+  if (!assistantMessage) return false
+
+  return assistantMessage.stopReason !== 'error' && assistantMessage.stopReason !== 'aborted'
+}
+
 function extractAssistantText(message: unknown): string {
-  if (!isAssistantMessage(message)) return ''
+  const assistantMessage = getAssistantMessage(message)
+  if (!assistantMessage) return ''
 
   let text = ''
-  for (const block of message.content) {
+  for (const block of assistantMessage.content) {
     if (block.type === 'text' && typeof block.text === 'string') {
       text += block.text
     }
   }
-  return text
+
+  if (text.trim()) return text
+  return buildAssistantFallbackText(assistantMessage)
 }
 
 function extractAssistantTextFromMessages(messages: unknown[]): string {
-  let text = ''
-  for (const message of messages) {
-    text += extractAssistantText(message)
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const text = extractAssistantText(messages[index])
+    if (text) return text
   }
-  return text
+  return ''
 }
 
-function isAssistantMessage(
-  value: unknown,
-): value is { role: 'assistant'; content: Array<{ type: string; text?: string }> } {
+function buildAssistantFallbackText(message: AssistantMessageLike): string {
+  if (message.stopReason === 'error') {
+    const errorText = message.errorMessage?.trim()
+    return errorText ? `[Pi error] ${errorText}` : '[Pi error]'
+  }
+
+  if (message.stopReason === 'aborted') {
+    return '[Request aborted]'
+  }
+
+  return ''
+}
+
+function getAssistantMessage(value: unknown): AssistantMessageLike | undefined {
+  if (!isAssistantMessage(value)) return undefined
+  return value
+}
+
+function isAssistantMessage(value: unknown): value is AssistantMessageLike {
   if (!value || typeof value !== 'object') return false
 
-  const maybeMessage = value as { role?: unknown; content?: unknown }
+  const maybeMessage = value as { role?: unknown; content?: unknown; stopReason?: unknown; errorMessage?: unknown }
   if (maybeMessage.role !== 'assistant') return false
   if (!Array.isArray(maybeMessage.content)) return false
+  if (maybeMessage.stopReason !== undefined && typeof maybeMessage.stopReason !== 'string') return false
+  if (maybeMessage.errorMessage !== undefined && typeof maybeMessage.errorMessage !== 'string') return false
 
   return maybeMessage.content.every((block) => {
     if (!block || typeof block !== 'object') return false
